@@ -1,0 +1,6 @@
+snapshot-go.exe
+snapshot.exe
+gitsnapshot.exe
+*.test.exe
+.tools/
+.build/

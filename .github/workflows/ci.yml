@@ -79,3 +79,9 @@ jobs:
 
       - name: Smoke-test CLI
         run: ${{ matrix.command }} --help
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: snapshot-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ${{ matrix.binary }}

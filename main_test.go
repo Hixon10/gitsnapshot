@@ -29,6 +29,9 @@ func TestParseOptions(t *testing.T) {
 		{"ignored", []string{"--include-ignored"}, options{command: "save", includeIgnored: true}, false},
 		{"help", []string{"--help"}, options{command: "save", help: true}, false},
 		{"list", []string{"LIST"}, options{command: "list"}, false},
+		{"list alias", []string{"ls"}, options{command: "list"}, false},
+		{"uppercase list alias", []string{"LS"}, options{command: "list"}, false},
+		{"list alias help", []string{"ls", "--help"}, options{command: "list", help: true}, false},
 		{
 			"index",
 			[]string{"diff", "A", "B", "--index", "--binary", "--exit-code"},
@@ -47,6 +50,8 @@ func TestParseOptions(t *testing.T) {
 		{"unknown command", []string{"restore", "A"}, options{}, true},
 		{"unknown option", []string{"diff", "--no-index"}, options{}, true},
 		{"unexpected list option", []string{"list", "--all"}, options{}, true},
+		{"unexpected list alias option", []string{"ls", "--all"}, options{}, true},
+		{"unexpected list alias argument", []string{"ls", "extra"}, options{}, true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -65,6 +70,9 @@ func TestInstalledCommandHints(t *testing.T) {
 	if !strings.Contains(helpText, "\n  snapshot list\n") {
 		t.Fatal("help must advertise the installed snapshot command")
 	}
+	if !strings.Contains(helpText, `"ls" is an alias for "list".`) {
+		t.Fatal("help must advertise the list alias")
+	}
 	canonicalHint := func(message string) bool {
 		return strings.Contains(message, "'snapshot ") || strings.Contains(message, "'snapshot'")
 	}
@@ -72,6 +80,7 @@ func TestInstalledCommandHints(t *testing.T) {
 		{"restore"},
 		{"save", "--bad"},
 		{"list", "--bad"},
+		{"ls", "--bad"},
 		{"diff", "--bad"},
 		{"delete", "--bad"},
 		{"delete"},
@@ -439,6 +448,9 @@ func TestGitSnapshotRoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if got, want := cli(0, "ls"), cli(0, "list"); got != want {
+				t.Fatalf("empty list alias output = %q, want %q", got, want)
+			}
 			first := strings.TrimSpace(cli(0, "save"))
 			ref := repo.refPrefix + first
 			if !strings.HasPrefix(first, "main-") {
@@ -513,7 +525,13 @@ func TestGitSnapshotRoundTrip(t *testing.T) {
 			if got := cli(0, "diff", "--name-only", "--exit-code"); got != "" {
 				t.Fatalf("latest snapshot differs immediately after save: %q", got)
 			}
-			lines := strings.Split(strings.TrimSpace(cli(0, "list")), "\n")
+			listOutput := cli(0, "list")
+			for _, alias := range []string{"ls", "LS"} {
+				if got := cli(0, alias); got != listOutput {
+					t.Fatalf("%s output = %q, want %q", alias, got, listOutput)
+				}
+			}
+			lines := strings.Split(strings.TrimSpace(listOutput), "\n")
 			if len(lines) != 3 || strings.Fields(lines[1])[0] != second || strings.Fields(lines[2])[0] != first {
 				t.Fatalf("snapshot ordering = %v", lines)
 			}

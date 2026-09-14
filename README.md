@@ -36,7 +36,7 @@ and `macos-latest` (arm64). CI pins Go 1.27.1 and golangci-lint 2.13.2.
 | Command | Description |
 | --- | --- |
 | `snapshot` or `snapshot save` | Save the current repository state. Names use the branch and local time, such as `main-2026-09-13-T-11-40`; collisions receive a numeric suffix. |
-| `snapshot list` | List snapshots for the current worktree, newest first. |
+| `snapshot list` or `snapshot ls` | List snapshots for the current worktree, newest first. |
 | `snapshot diff` | Compare the latest snapshot for the current branch with current files, including untracked additions and edits. |
 | `snapshot diff <name>` | Compare a named snapshot with current files. |
 | `snapshot diff <older> <newer>` | Compare two saved snapshots. |

@@ -34,6 +34,7 @@ const helpText = `Usage:
 
 Snapshot names use local time: <branch>-2026-09-13-T-11-40.
 Same-minute names receive -2, -3, etc. List is newest first.
+"ls" is an alias for "list".
 
 Diff defaults to latest -> current files, including untracked files.
 One name compares that snapshot with current files; two compare snapshots.
@@ -157,6 +158,8 @@ func parseOptions(arguments []string) (options, error) {
 	case "help":
 		result.help = true
 		return result, nil
+	case "ls":
+		result.command = "list"
 	case "save", "list", "diff", "delete":
 	default:
 		return result, fmt.Errorf("Unknown command %q. Run 'snapshot --help'.", result.command)

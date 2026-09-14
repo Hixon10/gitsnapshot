@@ -1,5 +1,3 @@
-//go:build windows
-
 package main
 
 import (
@@ -17,7 +15,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 	"unicode/utf8"
 )
@@ -228,9 +225,9 @@ func runCLI(arguments []string, output, errorOutput io.Writer) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("get working directory: %w", err)
 	}
-	gitExecutable, err := exec.LookPath("git.exe")
+	gitExecutable, err := exec.LookPath("git")
 	if err != nil {
-		return 0, fmt.Errorf("find Git for Windows on PATH: %w", err)
+		return 0, fmt.Errorf("find Git on PATH: %w", err)
 	}
 	app := application{gitExecutable: gitExecutable, output: output, errorOutput: errorOutput}
 	repo, err := app.repository(directory)
@@ -278,13 +275,13 @@ func mergedEnvironment(base []string, overrides map[string]string) []string {
 	overridden := make(map[string]bool, len(overrides))
 	keys := make([]string, 0, len(overrides))
 	for key := range overrides {
-		overridden[strings.ToUpper(key)] = true
+		overridden[environmentKey(key)] = true
 		keys = append(keys, key)
 	}
 	result := make([]string, 0, len(base)+len(overrides))
 	for _, entry := range base {
 		key, _, _ := strings.Cut(entry, "=")
-		if !overridden[strings.ToUpper(key)] {
+		if !overridden[environmentKey(key)] {
 			result = append(result, entry)
 		}
 	}
@@ -308,7 +305,7 @@ func (app *application) git(directory string, arguments []string, environment ma
 	command := exec.Command(app.gitExecutable, commandArguments...)
 	command.Dir = directory
 	command.Env = mergedEnvironment(os.Environ(), overrides)
-	command.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	configureGitCommand(command)
 	if input != nil {
 		command.Stdin = bytes.NewReader(input)
 	}
@@ -354,6 +351,21 @@ func (app *application) text(directory string, arguments []string, environment m
 	return gitText(result.output)
 }
 
+func sameDirectory(left, right string) (bool, error) {
+	if left == right {
+		return true, nil
+	}
+	leftInfo, err := os.Stat(left)
+	if err != nil {
+		return false, fmt.Errorf("inspect Git directory: %w", err)
+	}
+	rightInfo, err := os.Stat(right)
+	if err != nil {
+		return false, fmt.Errorf("inspect common Git directory: %w", err)
+	}
+	return os.SameFile(leftInfo, rightInfo), nil
+}
+
 func (app *application) repository(directory string) (repository, error) {
 	if os.Getenv("GIT_INDEX_FILE") != "" {
 		return repository{}, errors.New("Unset GIT_INDEX_FILE before using snapshot; an overridden source index is not supported.")
@@ -367,10 +379,10 @@ func (app *application) repository(directory string) (repository, error) {
 	}
 	parts := strings.Split(paths, "\n")
 	if len(parts) != 4 {
-		return repository{}, errors.New("Git repository discovery did not return four paths.")
+		return repository{}, errors.New("Git repository discovery did not return four paths; repository paths containing newlines are not supported.")
 	}
 	for index, path := range parts {
-		path = strings.TrimSuffix(path, "\r")
+		path = gitPathLine(path)
 		if path == "" {
 			return repository{}, errors.New("Git repository discovery returned an empty path.")
 		}
@@ -379,8 +391,12 @@ func (app *application) repository(directory string) (repository, error) {
 			return repository{}, fmt.Errorf("resolve Git path: %w", err)
 		}
 	}
+	mainWorktree, err := sameDirectory(parts[1], parts[2])
+	if err != nil {
+		return repository{}, err
+	}
 	worktreeID := "main"
-	if !strings.EqualFold(parts[1], parts[2]) {
+	if !mainWorktree {
 		hash := sha256.Sum256([]byte(filepath.Base(parts[1])))
 		worktreeID = "linked-" + hex.EncodeToString(hash[:])
 	}
@@ -450,20 +466,9 @@ func (app *application) assertSourceUnchanged(repo repository, original captured
 }
 
 func acquireSnapshotLock(repo repository) (*os.File, error) {
-	path := filepath.Join(repo.gitDirectory, "gitsnapshot.lock")
-	name, err := syscall.UTF16PtrFromString(path)
-	if err != nil {
-		return nil, fmt.Errorf("snapshot lock path: %w", err)
-	}
-	// Disallow sharing while this process owns the lock handle.
-	handle, err := syscall.CreateFile(name, syscall.GENERIC_READ|syscall.GENERIC_WRITE,
-		0, nil, syscall.OPEN_ALWAYS, syscall.FILE_ATTRIBUTE_NORMAL, 0)
+	file, err := openSnapshotLock(filepath.Join(repo.gitDirectory, "gitsnapshot.lock"))
 	if err != nil {
 		return nil, fmt.Errorf("Cannot acquire the snapshot lock; another snapshot command may be running: %w", err)
-	}
-	file := os.NewFile(uintptr(handle), path)
-	if file == nil {
-		return nil, errors.Join(errors.New("Cannot open the snapshot lock handle."), syscall.CloseHandle(handle))
 	}
 	return file, nil
 }

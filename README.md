@@ -6,17 +6,30 @@ files and preserve staged contents separately.
 
 ## Build
 
-Requires Windows, a current Git installation on PATH, and Go 1.27.1 to build.
-The application uses only the Go standard library.
+Supports Windows x64, Linux x64 (including Ubuntu), and macOS arm64
+(Apple silicon M1-M5). Requires a current Git installation on PATH at
+runtime and Go 1.27.1 to build. The application uses only the Go standard
+library.
+
+On Linux and macOS:
 
 ```console
-go build -trimpath -buildvcs=false -o snapshot.exe .
+go build -trimpath -buildvcs=false -o snapshot .
 go test -count=1 .
 ```
+
+On Windows, use `-o snapshot.exe` instead. Build the package (`.`), not just
+`main.go`: Go automatically selects `platform_windows.go` or the shared
+Linux/macOS implementation in `platform_unix.go`. Keep both platform source
+files with the rest of the project when backing up or building from source.
 
 Add the executable's directory to PATH, or invoke it by its full path from
 the repository you want to snapshot. `-trimpath` and `-buildvcs=false` omit
 local source paths and repository revision metadata from the executable.
+
+Every push to `main` runs formatting checks, linting, tests, a build, and a
+CLI smoke test natively on `ubuntu-latest` (amd64), `windows-latest` (amd64),
+and `macos-latest` (arm64). CI pins Go 1.27.1 and golangci-lint 2.13.2.
 
 ## Commands
 
@@ -37,6 +50,8 @@ Diff options include `--stat`, `--name-only`, `--name-status`, `--binary`, and
 directory. Exit codes are `0` for success, `1` for differences with
 `--exit-code`, and `2` for errors. Restore, sparse working-file checkouts,
 unresolved merges, and submodule/nested-repository contents are not supported.
+Repository and Git metadata directory paths containing line-feed characters
+are also unsupported.
 
 ## Technical TL;DR
 

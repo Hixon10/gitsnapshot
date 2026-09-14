@@ -1,14 +1,17 @@
-//go:build windows
-
 package main
 
 import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -209,12 +212,21 @@ func TestSnapshotMetadata(t *testing.T) {
 	}
 }
 
-func TestByteAndEnvironmentHandling(t *testing.T) {
-	environment := mergedEnvironment([]string{"Path=original", "git_index_file=old", "OTHER=retained"},
+func TestEnvironmentHandling(t *testing.T) {
+	environment := mergedEnvironment([]string{
+		"Path=original", "PATH=old", "git_index_file=old", "GIT_INDEX_FILE=old", "OTHER=retained",
+	},
 		map[string]string{"PATH": "replacement", "GIT_INDEX_FILE": "private"})
-	if strings.Join(environment, "|") != "OTHER=retained|GIT_INDEX_FILE=private|PATH=replacement" {
-		t.Fatalf("case-insensitive environment replacement failed: %v", environment)
+	want := "OTHER=retained|GIT_INDEX_FILE=private|PATH=replacement"
+	if runtime.GOOS != "windows" {
+		want = "Path=original|git_index_file=old|" + want
 	}
+	if strings.Join(environment, "|") != want {
+		t.Fatalf("environment = %v, want %s", environment, want)
+	}
+}
+
+func TestByteHandling(t *testing.T) {
 	path := "odd [x] & \u00e9\u4e2d.txt"
 	entries := []byte("100644 " + strings.Repeat("1", 40) + " 0\t" + path + "\x00")
 	if err := assertNoGitlinks(entries); err != nil {
@@ -230,6 +242,33 @@ func TestByteAndEnvironmentHandling(t *testing.T) {
 	text, err := gitText([]byte(" preserve spaces \r\n"))
 	if err != nil || text != " preserve spaces " {
 		t.Fatalf("Git text = %q, error %v", text, err)
+	}
+}
+
+func TestDirectoryIdentity(t *testing.T) {
+	directory := t.TempDir()
+	alias := directory + string(os.PathSeparator) + "."
+	if same, err := sameDirectory(directory, alias); err != nil || !same {
+		t.Fatalf("directory alias = %v, error %v", same, err)
+	}
+	lower := filepath.Join(directory, "case")
+	upper := filepath.Join(directory, "CASE")
+	if err := os.Mkdir(lower, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err := os.Mkdir(upper, 0o700)
+	wantSame := errors.Is(err, os.ErrExist)
+	if err != nil && !wantSame {
+		t.Fatal(err)
+	}
+	if same, err := sameDirectory(lower, upper); err != nil || same != wantSame {
+		t.Fatalf("case-sensitive filesystem identity = %v, want %v, error %v", same, wantSame, err)
+	}
+	if same, err := sameDirectory(directory, lower); err != nil || same {
+		t.Fatalf("distinct directories = %v, error %v", same, err)
+	}
+	if _, err := sameDirectory(directory, filepath.Join(directory, "missing")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing directory error = %v", err)
 	}
 }
 
@@ -259,6 +298,14 @@ func TestLockAndIndexIsolation(t *testing.T) {
 	if err := withSnapshotLock(repo, func() error { return nil }); err != nil {
 		t.Fatalf("lock was not released: %v", err)
 	}
+	badRepo := repository{gitDirectory: filepath.Join(directory, "missing")}
+	called := false
+	if err := withSnapshotLock(badRepo, func() error {
+		called = true
+		return nil
+	}); err == nil || called {
+		t.Fatalf("failed acquisition allowed an operation: called=%v, error=%v", called, err)
+	}
 	path := filepath.Join(directory, "index")
 	missing, err := readSourceIndex(path)
 	if err != nil || missing.exists {
@@ -274,5 +321,250 @@ func TestLockAndIndexIsolation(t *testing.T) {
 	}
 	if _, err := readSourceIndex(directory); err == nil {
 		t.Fatal("index read errors must not become an empty staging area")
+	}
+}
+
+func isolateGitEnvironment(t *testing.T, directory string) {
+	t.Helper()
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(strings.ToUpper(key), "GIT_") {
+			t.Setenv(key, "")
+			if err := os.Unsetenv(key); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	config := filepath.Join(directory, "empty.config")
+	if err := os.WriteFile(config, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	templates := filepath.Join(directory, "templates")
+	if err := os.Mkdir(templates, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_ATTR_NOSYSTEM", "1")
+	t.Setenv("GIT_CONFIG_GLOBAL", config)
+	t.Setenv("GIT_TEMPLATE_DIR", templates)
+}
+
+func TestGitSnapshotRoundTrip(t *testing.T) {
+	for _, objectFormat := range []string{"sha1", "sha256"} {
+		t.Run(objectFormat, func(t *testing.T) {
+			directory := t.TempDir()
+			isolateGitEnvironment(t, directory)
+			root := filepath.Join(directory, "work tree [x] & space")
+			if runtime.GOOS != "windows" {
+				root += "\r"
+			}
+			if err := os.Mkdir(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Chdir(root)
+			if runtime.GOOS == "windows" {
+				// Git objects are read-only; clear that attribute before TempDir cleanup.
+				t.Cleanup(func() {
+					err := filepath.WalkDir(directory, func(path string, entry fs.DirEntry, err error) error {
+						if err != nil {
+							return err
+						}
+						if entry.Type().IsRegular() {
+							return os.Chmod(path, 0o600)
+						}
+						return nil
+					})
+					if err != nil {
+						t.Errorf("prepare fixture cleanup: %v", err)
+					}
+				})
+			}
+			gitExecutable, err := exec.LookPath("git")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var diagnostics bytes.Buffer
+			app := application{gitExecutable: gitExecutable, output: io.Discard, errorOutput: &diagnostics}
+			git := func(arguments ...string) string {
+				t.Helper()
+				result, err := app.git(root, arguments, nil, nil)
+				if err != nil {
+					t.Fatalf("git %v: %v", arguments, err)
+				}
+				return string(result.output)
+			}
+			write := func(name, contents string) {
+				t.Helper()
+				if err := os.WriteFile(filepath.Join(root, name), []byte(contents), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cli := func(wantCode int, arguments ...string) string {
+				t.Helper()
+				var output, errorOutput bytes.Buffer
+				code, err := runCLI(arguments, &output, &errorOutput)
+				if err != nil || code != wantCode {
+					t.Fatalf("snapshot %v: code=%d, want=%d, error=%v, stderr=%s",
+						arguments, code, wantCode, err, errorOutput.String())
+				}
+				return output.String()
+			}
+			git("init", "--quiet", "--initial-branch=main", "--object-format="+objectFormat)
+			git("config", "core.autocrlf", "false")
+			git("config", "user.name", "Snapshot Tests")
+			git("config", "user.email", "tests@example.invalid")
+			write(".gitignore", "*.ignored\n")
+			write("tracked.txt", "base\n")
+			if runtime.GOOS != "windows" {
+				write("executable", "content\n")
+			}
+			git("add", "--", ".")
+			git("commit", "--quiet", "-m", "Initial fixture")
+			write("tracked.txt", "staged\n")
+			git("add", "--", "tracked.txt")
+			write("tracked.txt", "working\n")
+			write("local.config", "before\n")
+			write("cache.ignored", "ignored\n")
+			if runtime.GOOS != "windows" {
+				if err := os.Symlink("tracked.txt", filepath.Join(root, "link")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			repo, err := app.repository(root)
+			if err != nil || repo.worktreeID != "main" {
+				t.Fatalf("main worktree discovery: %#v, error %v", repo, err)
+			}
+			headBefore := git("rev-parse", "HEAD")
+			indexBefore, err := os.ReadFile(repo.indexPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			first := strings.TrimSpace(cli(0, "save"))
+			ref := repo.refPrefix + first
+			if !strings.HasPrefix(first, "main-") {
+				t.Fatalf("snapshot name = %q", first)
+			}
+			if got := git("show", ref+":tracked.txt"); got != "working\n" {
+				t.Fatalf("working tree contents = %q", got)
+			}
+			if got := git("show", ref+"^:tracked.txt"); got != "staged\n" {
+				t.Fatalf("staged tree contents = %q", got)
+			}
+			if got := git("show", ref+":local.config"); got != "before\n" {
+				t.Fatalf("untracked contents = %q", got)
+			}
+			if got := git("ls-tree", "-r", "--name-only", ref); strings.Contains(got, "cache.ignored") {
+				t.Fatalf("ignored file was captured: %s", got)
+			}
+			if runtime.GOOS != "windows" {
+				if got := git("ls-tree", ref, "--", "link"); !strings.HasPrefix(got, "120000 ") {
+					t.Fatalf("symlink mode = %q", got)
+				}
+				if got := git("show", ref+":link"); got != "tracked.txt" {
+					t.Fatalf("symlink target = %q", got)
+				}
+				if got := git("ls-tree", ref, "--", "executable"); !strings.HasPrefix(got, "100644 ") {
+					t.Fatalf("original executable mode = %q", got)
+				}
+			}
+			write("tracked.txt", "agent changes\n")
+			write("local.config", "after\n")
+			write("new [x] & space.txt", "new\n")
+			wantPaths := []string{"local.config", "new [x] & space.txt", "tracked.txt"}
+			if runtime.GOOS != "windows" {
+				if err := os.Chmod(filepath.Join(root, "executable"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(filepath.Join(root, "link")); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("local.config", filepath.Join(root, "link")); err != nil {
+					t.Fatal(err)
+				}
+				wantPaths = append(wantPaths, "executable", "link")
+			}
+			sort.Strings(wantPaths)
+			wantDiff := strings.Join(wantPaths, "\n") + "\n"
+			if got := cli(1, "diff", first, "--name-only", "--exit-code"); got != wantDiff {
+				t.Fatalf("current diff = %q, want %q", got, wantDiff)
+			}
+			if got := cli(1, "diff", first, "--name-only", "--exit-code", "--", "new [x] & space.txt"); got != "new [x] & space.txt\n" {
+				t.Fatalf("literal path diff = %q", got)
+			}
+			if got := cli(0, "diff", first, "--index", "--name-only", "--exit-code"); got != "" {
+				t.Fatalf("unchanged staged diff = %q", got)
+			}
+			second := strings.TrimSpace(cli(0, "save"))
+			if first == second {
+				t.Fatal("save reused a snapshot name")
+			}
+			if runtime.GOOS != "windows" {
+				secondRef := repo.refPrefix + second
+				if got := git("ls-tree", secondRef, "--", "executable"); !strings.HasPrefix(got, "100755 ") {
+					t.Fatalf("changed executable mode = %q", got)
+				}
+				if got := git("show", secondRef+":link"); got != "local.config" {
+					t.Fatalf("changed symlink target = %q", got)
+				}
+			}
+			if got := cli(1, "diff", first, second, "--name-only", "--exit-code"); got != wantDiff {
+				t.Fatalf("saved diff = %q, want %q", got, wantDiff)
+			}
+			if got := cli(0, "diff", "--name-only", "--exit-code"); got != "" {
+				t.Fatalf("latest snapshot differs immediately after save: %q", got)
+			}
+			lines := strings.Split(strings.TrimSpace(cli(0, "list")), "\n")
+			if len(lines) != 3 || strings.Fields(lines[1])[0] != second || strings.Fields(lines[2])[0] != first {
+				t.Fatalf("snapshot ordering = %v", lines)
+			}
+			linkedRoot := filepath.Join(directory, "linked worktree")
+			git("worktree", "add", "--quiet", "-b", "linked", linkedRoot, "HEAD")
+			linkedRepo, err := app.repository(linkedRoot)
+			if err != nil || !strings.HasPrefix(linkedRepo.worktreeID, "linked-") {
+				t.Fatalf("linked worktree discovery: %#v, error %v", linkedRepo, err)
+			}
+			if _, err := app.save(linkedRepo, false); err != nil {
+				t.Fatal(err)
+			}
+			for _, item := range []struct {
+				repo  repository
+				count int
+			}{{repo, 2}, {linkedRepo, 1}} {
+				snapshots, err := app.snapshots(item.repo)
+				if err != nil || len(snapshots) != item.count {
+					t.Fatalf("worktree snapshot isolation: got=%d, want=%d, error=%v", len(snapshots), item.count, err)
+				}
+			}
+			cli(0, "delete", first)
+			snapshots, err := app.snapshots(repo)
+			if err != nil || len(snapshots) != 1 || snapshots[0].Name != second {
+				t.Fatalf("snapshot deletion: %v, error %v", snapshots, err)
+			}
+			if got := git("rev-parse", "HEAD"); got != headBefore {
+				t.Fatalf("HEAD changed: %q, want %q", got, headBefore)
+			}
+			indexAfter, err := os.ReadFile(repo.indexPath)
+			if err != nil || !bytes.Equal(indexBefore, indexAfter) {
+				t.Fatalf("real index changed, read error %v", err)
+			}
+			for name, want := range map[string]string{
+				"tracked.txt": "agent changes\n", "local.config": "after\n",
+				"new [x] & space.txt": "new\n", "cache.ignored": "ignored\n",
+			} {
+				got, err := os.ReadFile(filepath.Join(root, name))
+				if err != nil || string(got) != want {
+					t.Fatalf("working file %s changed: %q, error %v", name, got, err)
+				}
+			}
+			entries, err := os.ReadDir(repo.gitDirectory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if strings.HasPrefix(entry.Name(), "gitsnapshot-") && strings.Contains(entry.Name(), ".index") {
+					t.Fatalf("temporary index was not cleaned up: %s", entry.Name())
+				}
+			}
+		})
 	}
 }

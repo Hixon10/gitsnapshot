@@ -11,16 +11,38 @@ permissions:
 env:
   GO_VERSION: "1.27.1"
   GOLANGCI_LINT_VERSION: "v2.13.2"
-  GOARCH: amd64
   CGO_ENABLED: "0"
 
 jobs:
-  quality:
-    name: Format, lint, and cross-build
-    runs-on: ubuntu-latest
+  checks:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: Linux amd64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            binary: snapshot
+            command: ./snapshot
+          - target: Windows amd64
+            runner: windows-latest
+            goos: windows
+            goarch: amd64
+            binary: snapshot.exe
+            command: .\snapshot.exe
+          - target: macOS arm64
+            runner: macos-latest
+            goos: darwin
+            goarch: arm64
+            binary: snapshot
+            command: ./snapshot
     env:
-      GOOS: windows
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -43,33 +65,17 @@ jobs:
       - name: Check formatting
         run: golangci-lint fmt --config=.golangci.yml --diff
 
+      - name: Validate linter configuration
+        run: golangci-lint config verify --config=.golangci.yml
+
       - name: Lint
-        run: |
-          golangci-lint config verify --config=.golangci.yml
-          golangci-lint run --config=.golangci.yml
-
-      - name: Cross-build Windows executable
-        run: go build -trimpath -buildvcs=false -o snapshot.exe .
-
-  windows-tests:
-    name: Native Windows tests
-    needs: quality
-    runs-on: windows-latest
-    timeout-minutes: 15
-    steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: false
+        run: golangci-lint run --config=.golangci.yml
 
       - name: Test
         run: go test -count=1 .
 
       - name: Build
-        run: go build -trimpath -buildvcs=false -o snapshot.exe .
+        run: go build -trimpath -buildvcs=false -o ${{ matrix.binary }} .
+
+      - name: Smoke-test CLI
+        run: ${{ matrix.command }} --help
